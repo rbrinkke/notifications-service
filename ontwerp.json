@@ -1,0 +1,27 @@
+{
+  "name": "notifications-service",
+  "language": "rust",
+  "description": "Rust notification worker + WebSocket server + FCM Push",
+  "architecture": "wake-up-and-work",
+  "components": {
+    "websocket_server": "axum + tokio-tungstenite",
+    "database": "sqlx + postgres",
+    "push": "FCM HTTP v1 API via reqwest",
+    "worker": "tokio::select! (NOTIFY + 60s timeout)"
+  },
+  "flow": [
+    "INSERT notification → Postgres NOTIFY",
+    "Worker wakes up",
+    "Fetch is_processed=false",
+    "If user connected → send sync_notify via WS",
+    "If user offline → send FCM push",
+    "Update is_processed=true"
+  ],
+  "database": {
+    "host": "localhost",
+    "port": 5441,
+    "database": "activitydb",
+    "table": "activity.notifications",
+    "trigger_column": "is_processed"
+  }
+}

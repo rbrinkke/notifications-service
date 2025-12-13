@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifications-service
+  namespace: activity-prod
+  labels:
+    app: notifications-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notifications-service
+  template:
+    metadata:
+      labels:
+        app: notifications-service
+    spec:
+      containers:
+        - name: notifications-service
+          image: notifications-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: DATABASE_URL
+              value: "postgres://postgres:postgres_secure_password_change_in_prod@172.18.0.1:5441/activitydb"
+            - name: WEBSOCKET_HOST
+              value: "0.0.0.0"
+            - name: WEBSOCKET_PORT
+              value: "8080"
+            - name: WORKER_POLL_INTERVAL_SECS
+              value: "60"
+            - name: WORKER_BATCH_SIZE
+              value: "100"
+            - name: MAX_RETRIES
+              value: "3"
+            - name: RUST_LOG
+              value: "info"
+            # Debug Mode - Ultra Logging
+            # Set DEBUG_MODE=true to enable verbose logging
+            - name: DEBUG_MODE
+              value: "false"
+            - name: DEBUG_LOG_PAYLOADS
+              value: "false"
+            - name: DEBUG_LOG_SQL
+              value: "false"
+            - name: DEBUG_LOG_FCM_TOKENS
+              value: "false"
+            - name: DEBUG_LOG_TIMING
+              value: "true"
+            # FCM - Firebase Cloud Messaging for push notifications
+            - name: FCM_PROJECT_ID
+              value: "goamet-notifications"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "/secrets/fcm/service-account.json"
+          volumeMounts:
+            - name: fcm-credentials
+              mountPath: /secrets/fcm
+              readOnly: true
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: fcm-credentials
+          secret:
+            secretName: fcm-credentials
+            optional: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notifications-service
+  namespace: activity-prod
+  labels:
+    app: notifications-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: notifications-service
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: notifications-service
+  namespace: activity-prod
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+    - host: notifications.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: notifications-service
+                port:
+                  number: 80
