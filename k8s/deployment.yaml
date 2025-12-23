@@ -25,10 +25,18 @@ spec:
           env:
             - name: DATABASE_URL
               value: "postgres://postgres:postgres_secure_password_change_in_prod@172.18.0.1:5441/activitydb"
-            - name: WEBSOCKET_HOST
+            - name: HOST
               value: "0.0.0.0"
-            - name: WEBSOCKET_PORT
+            - name: PORT
               value: "8080"
+            # WebSocket Bus (unified real-time messaging)
+            - name: WEBSOCKET_BUS_URL
+              value: "http://websocket-bus:80"
+            - name: SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: chat-api-secrets
+                  key: service-token
             - name: WORKER_POLL_INTERVAL_SECS
               value: "60"
             - name: WORKER_BATCH_SIZE
@@ -36,7 +44,7 @@ spec:
             - name: MAX_RETRIES
               value: "3"
             - name: RUST_LOG
-              value: "info"
+              value: "info,bus_client=debug"
             # Debug Mode - Ultra Logging
             # Set DEBUG_MODE=true to enable verbose logging
             - name: DEBUG_MODE

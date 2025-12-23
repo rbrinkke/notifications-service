@@ -1,8 +1,8 @@
+use bus_client::{BusClient, BusEnvelope};
 use crate::config::Config;
 use crate::db::{NotificationQueries, Database};
-use crate::models::{Notification, SyncNotifyMessage};
+use crate::models::Notification;
 use crate::push::{FcmClient, fcm::FcmError};
-use crate::ws::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,14 +13,14 @@ use uuid::Uuid;
 pub struct NotificationWorker {
     pool: PgPool,
     config: Config,
-    connection_manager: ConnectionManager,
+    bus_client: Option<Arc<BusClient>>,
     fcm_client: Option<Arc<FcmClient>>,
 }
 
 /// Batch processing statistics
 struct BatchStats {
     total: usize,
-    ws_success: usize,
+    bus_success: usize,
     push_success: usize,
     failed: usize,
     duration: Duration,
@@ -30,20 +30,21 @@ impl NotificationWorker {
     pub fn new(
         db: &Database,
         config: Config,
-        connection_manager: ConnectionManager,
+        bus_client: Option<Arc<BusClient>>,
         fcm_client: Option<Arc<FcmClient>>,
     ) -> Self {
         debug!(
             poll_interval = config.worker_poll_interval_secs,
             batch_size = config.worker_batch_size,
             max_retries = config.max_retries,
+            bus_enabled = bus_client.is_some(),
             fcm_enabled = fcm_client.is_some(),
             "Creating NotificationWorker"
         );
         Self {
             pool: db.pool().clone(),
             config,
-            connection_manager,
+            bus_client,
             fcm_client,
         }
     }
@@ -56,7 +57,8 @@ impl NotificationWorker {
         info!("  Poll interval: {}s", self.config.worker_poll_interval_secs);
         info!("  Batch size: {}", self.config.worker_batch_size);
         info!("  Max retries: {}", self.config.max_retries);
-        info!("  FCM enabled: {}", self.fcm_client.is_some());
+        info!("  WebSocket Bus: {}", if self.bus_client.is_some() { "ENABLED" } else { "DISABLED" });
+        info!("  FCM: {}", if self.fcm_client.is_some() { "ENABLED" } else { "DISABLED" });
         info!("═══════════════════════════════════════════════════════════");
 
         let mut cycle_count: u64 = 0;
@@ -110,7 +112,7 @@ impl NotificationWorker {
     #[instrument(skip(self), name = "process_all_pending")]
     async fn process_all_pending(&self) {
         let mut total_processed = 0;
-        let mut total_ws = 0;
+        let mut total_bus = 0;
         let mut total_push = 0;
         let mut total_failed = 0;
         let overall_start = Instant::now();
@@ -144,7 +146,7 @@ impl NotificationWorker {
                         let result = self.process_one(notification.clone()).await;
 
                         match result {
-                            DeliveryResult::WebSocket => total_ws += 1,
+                            DeliveryResult::Bus => total_bus += 1,
                             DeliveryResult::Push => total_push += 1,
                             DeliveryResult::Failed => total_failed += 1,
                         }
@@ -176,7 +178,7 @@ impl NotificationWorker {
             info!("═══════════════════════════════════════════════════════════");
             info!("  BATCH COMPLETE");
             info!("  Total processed: {}", total_processed);
-            info!("  Success via WebSocket: {}", total_ws);
+            info!("  Success via Bus: {}", total_bus);
             info!("  Success via Push: {}", total_push);
             info!("  Failed (will retry): {}", total_failed);
             info!("  Total duration: {}ms", overall_duration.as_millis());
@@ -208,52 +210,47 @@ impl NotificationWorker {
         trace!("  created_at: {}", notification.created_at);
         trace!("══════════════════════════════════════════════════");
 
-        // Check WebSocket connection status
-        debug!("Checking WebSocket connection for user {}", user_id);
-        let is_connected = self.connection_manager.is_connected(&user_id).await;
-        let connection_count = self.connection_manager.connection_count(&user_id).await;
+        // Try WebSocket Bus first if configured
+        if let Some(bus) = &self.bus_client {
+            trace!("Attempting delivery via WebSocket Bus...");
 
-        debug!(
-            user_id = %user_id,
-            connected = is_connected,
-            connection_count = connection_count,
-            "User connection status"
-        );
-
-        // Try WebSocket first if connected
-        if is_connected {
-            trace!("User is ONLINE, attempting WebSocket delivery...");
-
-            match self.send_via_websocket(&notification).await {
-                Ok(sent_count) => {
+            match self.send_via_bus(bus, &notification).await {
+                Ok(delivered_to) if delivered_to > 0 => {
                     let duration = start.elapsed();
                     info!(
                         notification_id = %notification_id,
                         user_id = %user_id,
-                        connections_sent = sent_count,
+                        delivered_to = delivered_to,
                         duration_ms = duration.as_millis() as u64,
-                        "✓ Delivered via WebSocket"
+                        "✓ Delivered via WebSocket Bus"
                     );
                     self.mark_success(notification_id).await;
-                    return DeliveryResult::WebSocket;
+                    return DeliveryResult::Bus;
+                }
+                Ok(_) => {
+                    // delivered_to == 0: User has no active connections
+                    debug!(
+                        user_id = %user_id,
+                        "User has no active WebSocket connections, falling back to FCM"
+                    );
                 }
                 Err(e) => {
                     warn!(
                         notification_id = %notification_id,
                         user_id = %user_id,
                         error = %e,
-                        "WebSocket delivery failed, falling back to push"
+                        "WebSocket Bus delivery failed, falling back to FCM"
                     );
                 }
             }
         } else {
             debug!(
                 user_id = %user_id,
-                "User is OFFLINE, skipping WebSocket, trying push"
+                "WebSocket Bus not configured, trying FCM directly"
             );
         }
 
-        // User offline or WS failed - try push notification
+        // User offline or Bus failed/not configured - try push notification
         trace!("Attempting push notification delivery...");
         match self.send_via_push(&notification).await {
             Ok(device_count) => {
@@ -283,44 +280,47 @@ impl NotificationWorker {
         }
     }
 
-    /// Send sync_notify via WebSocket
-    #[instrument(skip(self, notification), fields(
+    /// Send sync_notify via WebSocket Bus
+    #[instrument(skip(self, bus, notification), fields(
         notification_id = %notification.notification_id,
         user_id = %notification.user_id
     ))]
-    async fn send_via_websocket(&self, notification: &Notification) -> Result<usize, String> {
+    async fn send_via_bus(&self, bus: &BusClient, notification: &Notification) -> Result<usize, String> {
         let start = Instant::now();
 
-        trace!("Creating sync_notify message with pending_count=1");
-        let message = SyncNotifyMessage::new(1);
-        let json = serde_json::to_string(&message)
-            .map_err(|e| {
-                error!(error = %e, "Failed to serialize sync_notify message");
-                format!("JSON serialize failed: {}", e)
-            })?;
+        // Create sync_notify envelope
+        // This tells the client to fetch new notifications from the API
+        let envelope = BusEnvelope::new("notifications", "sync_notify")
+            .with_payload(serde_json::json!({
+                "type": "sync_notify",
+                "count": 1
+            }));
 
-        trace!("sync_notify payload: {}", json);
-        trace!("Sending to user {} via ConnectionManager...", notification.user_id);
+        trace!("sync_notify envelope created: {:?}", envelope);
+        trace!("Publishing to user {} via WebSocket Bus...", notification.user_id);
 
-        let sent = self.connection_manager.send_to_user(&notification.user_id, &json).await;
-        let duration = start.elapsed();
-
-        if sent > 0 {
-            debug!(
-                notification_id = %notification.notification_id,
-                user_id = %notification.user_id,
-                connections_reached = sent,
-                duration_ms = duration.as_millis() as u64,
-                "sync_notify sent via WebSocket"
-            );
-            Ok(sent)
-        } else {
-            debug!(
-                user_id = %notification.user_id,
-                duration_ms = duration.as_millis() as u64,
-                "No active WebSocket connections found"
-            );
-            Err("No active connections".to_string())
+        match bus.publish_to_user(notification.user_id, &envelope).await {
+            Ok(response) => {
+                let duration = start.elapsed();
+                debug!(
+                    notification_id = %notification.notification_id,
+                    user_id = %notification.user_id,
+                    delivered_to = response.delivered_to,
+                    duration_ms = duration.as_millis() as u64,
+                    "sync_notify published via Bus"
+                );
+                Ok(response.delivered_to)
+            }
+            Err(e) => {
+                let duration = start.elapsed();
+                warn!(
+                    user_id = %notification.user_id,
+                    error = %e,
+                    duration_ms = duration.as_millis() as u64,
+                    "Failed to publish to WebSocket Bus"
+                );
+                Err(e.to_string())
+            }
         }
     }
 
@@ -478,7 +478,7 @@ impl NotificationWorker {
                         notification_id = %notification_id,
                         max_retries = self.config.max_retries,
                         duration_ms = duration.as_millis() as u64,
-                        "⚠ Notification permanently failed - max retries reached"
+                        "Notification permanently failed - max retries reached"
                     );
                 } else {
                     debug!(
@@ -503,7 +503,7 @@ impl NotificationWorker {
 
 /// Result of notification delivery attempt
 enum DeliveryResult {
-    WebSocket,
+    Bus,
     Push,
     Failed,
 }

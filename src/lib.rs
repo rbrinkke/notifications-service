@@ -3,4 +3,4 @@ pub mod db;
 pub mod models;
 pub mod push;
 pub mod worker;
-pub mod ws;
+// ws module removed - using websocket-bus via bus-client

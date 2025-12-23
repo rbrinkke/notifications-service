@@ -1,48 +1,67 @@
-# Build stage
-FROM rust:latest AS builder
+# ==============================================================================
+# Notifications Service - Optimized Build with cargo-chef
+# ==============================================================================
+# Rebuild tijd: ~20 sec voor code changes (was 2-3 min)
+# Build from: docker build -f services/notifications-service/Dockerfile .
+# ==============================================================================
 
+# ------------------------------------------------------------------------------
+# Stage 1: Chef Base
+# ------------------------------------------------------------------------------
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /app
 
-# Install build dependencies
+# ------------------------------------------------------------------------------
+# Stage 2: Prepare Recipe
+# ------------------------------------------------------------------------------
+FROM chef AS planner
+# Copy bus-client library (required dependency)
+COPY libs/bus-client /libs/bus-client
+COPY services/notifications-service/Cargo.toml services/notifications-service/Cargo.lock* ./
+COPY services/notifications-service/src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ------------------------------------------------------------------------------
+# Stage 3: Build Dependencies (CACHED!)
+# ------------------------------------------------------------------------------
+FROM chef AS builder
+
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock* ./
+# Copy bus-client library (required for dependency resolution)
+COPY libs/bus-client /libs/bus-client
 
-# Create dummy main to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src
+# Cook dependencies from recipe
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --profile dev-release --recipe-path recipe.json
 
-# Copy actual source
-COPY src ./src
+# Copy source and build application
+COPY services/notifications-service/Cargo.toml services/notifications-service/Cargo.lock* ./
+COPY services/notifications-service/src ./src
+RUN cargo build --profile dev-release
 
-# Build for release
-RUN touch src/main.rs && cargo build --release
-
-# Runtime stage
-FROM debian:bookworm-slim
+# ------------------------------------------------------------------------------
+# Stage 4: Runtime
+# ------------------------------------------------------------------------------
+# Note: Must use trixie to match GLIBC version from cargo-chef builder
+FROM debian:trixie-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy binary from builder
-COPY --from=builder /app/target/release/notifications-service /app/notifications-service
+COPY --from=builder /app/target/dev-release/notifications-service /app/notifications-service
+COPY services/notifications-service/migrations ./migrations
 
-# Copy migrations
-COPY migrations ./migrations
-
-# Non-root user
 RUN useradd -r -u 1000 appuser
 USER appuser
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 

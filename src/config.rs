@@ -59,9 +59,13 @@ pub struct Config {
     // Database
     pub database_url: String,
 
-    // WebSocket
-    pub websocket_host: String,
-    pub websocket_port: u16,
+    // HTTP Server (health + metrics only, no WS)
+    pub server_host: String,
+    pub server_port: u16,
+
+    // WebSocket Bus (unified real-time messaging)
+    pub websocket_bus_url: Option<String>,
+    pub service_token: Option<String>,
 
     // FCM Push
     pub fcm_project_id: Option<String>,
@@ -84,11 +88,15 @@ impl Config {
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5441/activitydb".into()),
 
-            websocket_host: env::var("WEBSOCKET_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
-            websocket_port: env::var("WEBSOCKET_PORT")
+            server_host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
+            server_port: env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
+
+            // WebSocket Bus configuration
+            websocket_bus_url: env::var("WEBSOCKET_BUS_URL").ok(),
+            service_token: env::var("SERVICE_TOKEN").ok(),
 
             fcm_project_id: env::var("FCM_PROJECT_ID").ok(),
             fcm_credentials_path: env::var("GOOGLE_APPLICATION_CREDENTIALS").ok(),
@@ -111,7 +119,12 @@ impl Config {
         }
     }
 
-    pub fn websocket_addr(&self) -> String {
-        format!("{}:{}", self.websocket_host, self.websocket_port)
+    pub fn server_addr(&self) -> String {
+        format!("{}:{}", self.server_host, self.server_port)
+    }
+
+    /// Check if websocket-bus is configured
+    pub fn has_bus(&self) -> bool {
+        self.websocket_bus_url.is_some() && self.service_token.is_some()
     }
 }

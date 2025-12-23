@@ -1,8 +1,9 @@
+use axum::{routing::get, Router};
+use bus_client::BusClient;
 use notifications_service::config::Config;
 use notifications_service::db::{Database, NotificationListener};
 use notifications_service::push::FcmClient;
 use notifications_service::worker::NotificationWorker;
-use notifications_service::ws::{create_router, ConnectionManager};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -23,7 +24,7 @@ async fn main() {
 
     // Log debug configuration
     if config.debug.enabled {
-        warn!("🔍 DEBUG MODE ENABLED - verbose logging active");
+        warn!("DEBUG MODE ENABLED - verbose logging active");
         debug!("Debug config:");
         debug!("  log_payloads: {}", config.debug.log_payloads);
         debug!("  log_sql: {}", config.debug.log_sql);
@@ -31,7 +32,7 @@ async fn main() {
         debug!("  log_timing: {}", config.debug.log_timing);
     }
     info!(
-        ws_addr = %config.websocket_addr(),
+        server_addr = %config.server_addr(),
         poll_interval = config.worker_poll_interval_secs,
         batch_size = config.worker_batch_size,
         max_retries = config.max_retries,
@@ -79,10 +80,21 @@ async fn main() {
         }
     };
 
-    // Create shared connection manager
-    debug!("Creating connection manager...");
-    let connection_manager = ConnectionManager::new();
-    trace!("ConnectionManager initialized");
+    // Initialize BusClient for websocket-bus
+    debug!("Initializing WebSocket Bus client...");
+    let bus_client = match (&config.websocket_bus_url, &config.service_token) {
+        (Some(url), Some(token)) => {
+            let client = BusClient::new(url, token);
+            info!(bus_url = %url, "WebSocket Bus client initialized");
+            Some(Arc::new(client))
+        }
+        _ => {
+            warn!("WebSocket Bus not configured - real-time delivery disabled");
+            debug!("  WEBSOCKET_BUS_URL: {:?}", config.websocket_bus_url);
+            debug!("  SERVICE_TOKEN: {:?}", config.service_token.as_ref().map(|_| "[REDACTED]"));
+            None
+        }
+    };
 
     // Channel for NOTIFY signals to worker
     debug!("Creating wake channel (buffer size: 10)...");
@@ -100,10 +112,11 @@ async fn main() {
 
     // Start worker
     debug!("Starting notification worker...");
+    let fcm_enabled = fcm_client.is_some();
     let worker = NotificationWorker::new(
         &db,
         config.clone(),
-        connection_manager.clone(),
+        bus_client.clone(),
         fcm_client,
     );
     let worker_handle = tokio::spawn(async move {
@@ -115,10 +128,15 @@ async fn main() {
         "Notification worker started"
     );
 
-    // Start WebSocket server
-    debug!("Starting WebSocket server...");
-    let router = create_router(connection_manager);
-    let addr = config.websocket_addr();
+    // Start HTTP server (health + metrics only)
+    debug!("Starting HTTP server...");
+    let router = Router::new()
+        .route("/health", get(health_handler))
+        .route("/healthz", get(health_handler))
+        .route("/readyz", get(health_handler))
+        .route("/metrics", get(metrics_handler));
+
+    let addr = config.server_addr();
 
     let tcp_listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -126,16 +144,17 @@ async fn main() {
             l
         }
         Err(e) => {
-            error!(error = %e, addr = %addr, "Failed to bind WebSocket server");
+            error!(error = %e, addr = %addr, "Failed to bind HTTP server");
             std::process::exit(1);
         }
     };
 
     info!("═══════════════════════════════════════════════════════════");
     info!("  SERVICE READY");
-    info!("  WebSocket: ws://{}/ws", addr);
     info!("  Health:    http://{}/health", addr);
     info!("  Metrics:   http://{}/metrics", addr);
+    info!("  Bus:       {}", if bus_client.is_some() { "ENABLED" } else { "DISABLED" });
+    info!("  FCM:       {}", if fcm_enabled { "ENABLED" } else { "DISABLED" });
     info!("═══════════════════════════════════════════════════════════");
 
     // Run server with graceful shutdown
@@ -162,6 +181,18 @@ async fn main() {
     info!("═══════════════════════════════════════════════════════════");
     info!("  NOTIFICATIONS SERVICE STOPPED");
     info!("═══════════════════════════════════════════════════════════");
+}
+
+async fn health_handler() -> &'static str {
+    "OK"
+}
+
+async fn metrics_handler() -> String {
+    // Basic Prometheus metrics
+    let output = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder();
+    // For now, return empty metrics - can be expanded later
+    "# notifications_service metrics\n".to_string()
 }
 
 async fn shutdown_signal() {
@@ -197,12 +228,12 @@ fn init_logging(config: &Config) {
         // In debug mode: use trace level for our crate, debug for others
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| {
-                "notifications_service=trace,tower_http=debug,axum=debug,sqlx=debug".into()
+                "notifications_service=trace,tower_http=debug,axum=debug,sqlx=debug,bus_client=debug".into()
             })
     } else {
         // Production: use RUST_LOG or default to info
         tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "notifications_service=info".into())
+            .unwrap_or_else(|_| "notifications_service=info,bus_client=info".into())
     };
 
     if config.debug.enabled {
