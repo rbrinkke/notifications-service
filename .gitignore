@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Database
+*.db
+*.db-shm
+*.db-wal

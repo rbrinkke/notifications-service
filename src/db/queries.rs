@@ -19,7 +19,7 @@ impl NotificationQueries {
         let result = sqlx::query_as::<_, Notification>(
             r#"
             SELECT
-                notification_id,
+                id,
                 user_id,
                 actor_user_id,
                 notification_type::text as notification_type,
@@ -30,10 +30,12 @@ impl NotificationQueries {
                 payload,
                 deep_link,
                 priority,
+                deliver_at,
                 created_at
             FROM activity.notifications
             WHERE is_processed = false
-            ORDER BY created_at ASC
+              AND deliver_at <= NOW()
+            ORDER BY deliver_at ASC
             LIMIT $1
             "#,
         )
@@ -56,15 +58,15 @@ impl NotificationQueries {
                     trace!("DB fetch_unprocessed: notification IDs:");
                     for n in notifications.iter() {
                         trace!(
-                            "  - {} (user={}, type={}, created={})",
-                            n.notification_id,
+                            "  - {} (user={}, type={}, deliver_at={})",
+                            n.id,
                             n.user_id,
                             n.notification_type,
-                            n.created_at
+                            n.deliver_at
                         );
                     }
                 } else {
-                    trace!("DB fetch_unprocessed: no pending notifications");
+                    trace!("DB fetch_unprocessed: no pending notifications ready for delivery");
                 }
             }
             Err(e) => {
@@ -80,18 +82,18 @@ impl NotificationQueries {
     }
 
     /// Mark notification as successfully delivered
-    #[instrument(skip(pool), fields(notification_id = %notification_id))]
+    #[instrument(skip(pool), fields(id = %id))]
     pub async fn mark_success(
         pool: &PgPool,
-        notification_id: Uuid,
+        id: Uuid,
     ) -> Result<bool, sqlx::Error> {
-        trace!("DB mark_success: calling sp_notification_success({})", notification_id);
+        trace!("DB mark_success: calling sp_notification_success({})", id);
         let start = Instant::now();
 
         let result = sqlx::query_as::<_, (bool,)>(
             "SELECT activity.sp_notification_success($1)"
         )
-        .bind(notification_id)
+        .bind(id)
         .fetch_one(pool)
         .await;
 
@@ -101,13 +103,13 @@ impl NotificationQueries {
             Ok((success,)) => {
                 if *success {
                     debug!(
-                        notification_id = %notification_id,
+                        id = %id,
                         duration_ms = duration.as_millis() as u64,
                         "DB mark_success: notification marked as processed"
                     );
                 } else {
                     warn!(
-                        notification_id = %notification_id,
+                        id = %id,
                         duration_ms = duration.as_millis() as u64,
                         "DB mark_success: stored procedure returned false (notification not found?)"
                     );
@@ -115,7 +117,7 @@ impl NotificationQueries {
             }
             Err(e) => {
                 error!(
-                    notification_id = %notification_id,
+                    id = %id,
                     duration_ms = duration.as_millis() as u64,
                     error = %e,
                     "DB mark_success: failed to mark notification"
@@ -127,23 +129,23 @@ impl NotificationQueries {
     }
 
     /// Record delivery failure - returns true if max retries reached (stop trying)
-    #[instrument(skip(pool), fields(notification_id = %notification_id, error_message = %error_message, max_retries = max_retries))]
+    #[instrument(skip(pool), fields(id = %id, error_message = %error_message, max_retries = max_retries))]
     pub async fn mark_failure(
         pool: &PgPool,
-        notification_id: Uuid,
+        id: Uuid,
         error_message: &str,
         max_retries: i32,
     ) -> Result<bool, sqlx::Error> {
         trace!(
             "DB mark_failure: calling sp_notification_failure({}, '{}', {})",
-            notification_id, error_message, max_retries
+            id, error_message, max_retries
         );
         let start = Instant::now();
 
         let result = sqlx::query_as::<_, (bool,)>(
             "SELECT activity.sp_notification_failure($1, $2, $3)"
         )
-        .bind(notification_id)
+        .bind(id)
         .bind(error_message)
         .bind(max_retries)
         .fetch_one(pool)
@@ -155,7 +157,7 @@ impl NotificationQueries {
             Ok((max_reached,)) => {
                 if *max_reached {
                     warn!(
-                        notification_id = %notification_id,
+                        id = %id,
                         duration_ms = duration.as_millis() as u64,
                         max_retries = max_retries,
                         error_message = %error_message,
@@ -163,7 +165,7 @@ impl NotificationQueries {
                     );
                 } else {
                     debug!(
-                        notification_id = %notification_id,
+                        id = %id,
                         duration_ms = duration.as_millis() as u64,
                         error_message = %error_message,
                         "DB mark_failure: error recorded, will retry later"
@@ -172,7 +174,7 @@ impl NotificationQueries {
             }
             Err(e) => {
                 error!(
-                    notification_id = %notification_id,
+                    id = %id,
                     duration_ms = duration.as_millis() as u64,
                     error = %e,
                     "DB mark_failure: failed to record failure"

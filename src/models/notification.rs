@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Notification {
-    pub notification_id: Uuid,
+    pub id: Uuid,
     pub user_id: Uuid,
     pub actor_user_id: Option<Uuid>,
     pub notification_type: String,
@@ -16,6 +16,7 @@ pub struct Notification {
     pub payload: Option<serde_json::Value>,
     pub deep_link: Option<String>,
     pub priority: Option<String>,
+    pub deliver_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
 

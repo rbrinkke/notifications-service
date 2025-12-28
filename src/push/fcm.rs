@@ -328,7 +328,7 @@ impl FcmClient {
 
         trace!(
             token = %token_preview,
-            notification_id = %notification.notification_id,
+            id = %notification.id,
             notification_type = %notification.notification_type,
             "Sending FCM push notification..."
         );
@@ -350,8 +350,8 @@ impl FcmClient {
         // Build request data
         let mut data = std::collections::HashMap::new();
         data.insert(
-            "notification_id".to_string(),
-            notification.notification_id.to_string(),
+            "id".to_string(),
+            notification.id.to_string(),
         );
         data.insert(
             "type".to_string(),
@@ -460,6 +460,99 @@ impl FcmClient {
             "FCM send failed"
         );
         Err(FcmError::SendError(format!("{}: {}", status, body)))
+    }
+
+    /// Send push notification to a topic (Broadcast)
+    pub async fn send_to_topic(
+        &self,
+        topic: &str,
+        notification: &Notification,
+    ) -> Result<(), FcmError> {
+        let start = Instant::now();
+
+        trace!(
+            topic = %topic,
+            id = %notification.id,
+            notification_type = %notification.notification_type,
+            "Sending FCM broadcast to topic..."
+        );
+
+        // Get OAuth2 token
+        let access_token = self.get_access_token().await?;
+
+        let url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            self.project_id
+        );
+
+        // Build request data
+        let mut data = std::collections::HashMap::new();
+        data.insert("id".to_string(), notification.id.to_string());
+        data.insert("type".to_string(), notification.notification_type.clone());
+        if let Some(deep_link) = &notification.deep_link {
+            data.insert("deep_link".to_string(), deep_link.clone());
+        }
+
+        // Construct message payload for Topic
+        // Note: For topics, we use 'topic' field instead of 'token'
+        // Ideally, we might want 'condition' for more complex logic, but 'topic' is simpler.
+        let request = serde_json::json!({
+            "message": {
+                "topic": topic,
+                "notification": {
+                    "title": notification.title,
+                    "body": notification.message.as_deref().unwrap_or_default(),
+                },
+                "data": data,
+                "android": {
+                    "priority": "high", // Broadcasts usually important
+                },
+                "apns": {
+                    "payload": {
+                        "aps": {
+                            "sound": "default",
+                            "badge": 1,
+                            "content-available": 1,
+                        }
+                    }
+                }
+            }
+        });
+
+        // Send request
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&access_token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(error = %e, "FCM topic broadcast failed");
+                FcmError::SendError(format!("Broadcast failed: {}", e))
+            })?;
+
+        let status = response.status();
+        let total_time = start.elapsed();
+
+        if status.is_success() {
+            info!(
+                topic = %topic,
+                id = %notification.id,
+                duration_ms = total_time.as_millis() as u64,
+                "✓ FCM broadcast sent successfully"
+            );
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            error!(
+                topic = %topic,
+                status = %status,
+                body = %body,
+                "FCM broadcast failed"
+            );
+            Err(FcmError::SendError(format!("{}: {}", status, body)))
+        }
     }
 }
 

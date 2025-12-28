@@ -137,7 +137,7 @@ impl NotificationWorker {
                     trace!("Batch notification IDs:");
                     for n in &notifications {
                         trace!("  - {} (user: {}, type: {})",
-                            n.notification_id, n.user_id, n.notification_type);
+                            n.id, n.user_id, n.notification_type);
                     }
 
                     let batch_start = Instant::now();
@@ -190,23 +190,30 @@ impl NotificationWorker {
 
     /// Process a single notification
     #[instrument(skip(self, notification), fields(
-        notification_id = %notification.notification_id,
+        id = %notification.id,
         user_id = %notification.user_id,
         notification_type = %notification.notification_type
     ))]
     async fn process_one(&self, notification: Notification) -> DeliveryResult {
-        let notification_id = notification.notification_id;
+        let id = notification.id;
         let user_id = notification.user_id;
+
+        // Check for BROADCAST (UUID 00000000-0000-0000-0000-000000000000)
+        if user_id.is_nil() {
+            return self.process_broadcast(notification).await;
+        }
+
         let start = Instant::now();
 
         trace!("══════════════════════════════════════════════════");
         trace!("PROCESSING NOTIFICATION");
-        trace!("  notification_id: {}", notification_id);
+        trace!("  id: {}", id);
         trace!("  user_id: {}", user_id);
         trace!("  type: {}", notification.notification_type);
         trace!("  title: {:?}", notification.title);
         trace!("  message: {:?}", notification.message);
         trace!("  priority: {:?}", notification.priority);
+        trace!("  deliver_at: {}", notification.deliver_at);
         trace!("  created_at: {}", notification.created_at);
         trace!("══════════════════════════════════════════════════");
 
@@ -218,13 +225,13 @@ impl NotificationWorker {
                 Ok(delivered_to) if delivered_to > 0 => {
                     let duration = start.elapsed();
                     info!(
-                        notification_id = %notification_id,
+                        id = %id,
                         user_id = %user_id,
                         delivered_to = delivered_to,
                         duration_ms = duration.as_millis() as u64,
                         "✓ Delivered via WebSocket Bus"
                     );
-                    self.mark_success(notification_id).await;
+                    self.mark_success(id).await;
                     return DeliveryResult::Bus;
                 }
                 Ok(_) => {
@@ -236,7 +243,7 @@ impl NotificationWorker {
                 }
                 Err(e) => {
                     warn!(
-                        notification_id = %notification_id,
+                        id = %id,
                         user_id = %user_id,
                         error = %e,
                         "WebSocket Bus delivery failed, falling back to FCM"
@@ -256,58 +263,145 @@ impl NotificationWorker {
             Ok(device_count) => {
                 let duration = start.elapsed();
                 info!(
-                    notification_id = %notification_id,
+                    id = %id,
                     user_id = %user_id,
                     devices = device_count,
                     duration_ms = duration.as_millis() as u64,
                     "✓ Delivered via Push"
                 );
-                self.mark_success(notification_id).await;
+                self.mark_success(id).await;
                 DeliveryResult::Push
             }
             Err(e) => {
                 let duration = start.elapsed();
                 warn!(
-                    notification_id = %notification_id,
+                    id = %id,
                     user_id = %user_id,
                     error = %e,
                     duration_ms = duration.as_millis() as u64,
                     "✗ Delivery failed"
                 );
-                self.mark_failure(notification_id, &e).await;
+                self.mark_failure(id, &e).await;
                 DeliveryResult::Failed
             }
         }
     }
 
-    /// Send sync_notify via WebSocket Bus
+    /// Process a broadcast notification (User ID 0000...)
+    #[instrument(skip(self, notification), fields(id = %notification.id))]
+    async fn process_broadcast(&self, notification: Notification) -> DeliveryResult {
+        info!("📢 PROCESSING BROADCAST NOTIFICATION {}", notification.id);
+        let start = Instant::now();
+        let mut bus_success = false;
+        let mut push_success = false;
+
+        // 1. Broadcast via WebSocket Bus (Topic: "global_notifications")
+        if let Some(bus) = &self.bus_client {
+            // Create envelope for topic "global_notifications"
+            let envelope = BusEnvelope::new("global_notifications", "broadcast")
+                .with_payload(serde_json::json!({
+                    "type": "broadcast",
+                    "id": notification.id,
+                    "title": notification.title,
+                    "message": notification.message,
+                    "payload": notification.payload,
+                    "created_at": notification.created_at
+                }));
+
+            match bus.publish(&envelope).await {
+                Ok(response) => {
+                    info!(
+                        id = %notification.id,
+                        delivered_to = response.delivered_to,
+                        topic = "global_notifications",
+                        "✓ Broadcast published to WebSocket Bus"
+                    );
+                    bus_success = true;
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to publish broadcast to WebSocket Bus");
+                }
+            }
+        }
+
+        // 2. Broadcast via FCM (Topic: "all")
+        if let Some(fcm) = &self.fcm_client {
+            // Use send_to_topic("all", ...)
+            match fcm.send_to_topic("all", &notification).await {
+                Ok(_) => {
+                    info!(
+                        id = %notification.id,
+                        topic = "all",
+                        "✓ FCM broadcast sent to topic 'all'"
+                    );
+                    push_success = true;
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to send FCM broadcast");
+                }
+            }
+        } else {
+            warn!("FCM not configured, skipping push broadcast");
+        }
+
+        let duration = start.elapsed();
+        info!(
+            id = %notification.id,
+            duration_ms = duration.as_millis() as u64,
+            bus = bus_success,
+            push = push_success,
+            "Broadcast processing complete"
+        );
+
+        // Always mark as success if at least one method worked, or if we tried our best
+        // Broadcasts shouldn't block the queue forever
+        self.mark_success(notification.id).await;
+
+        if bus_success || push_success {
+            DeliveryResult::Bus // Return Bus/Push as generic success
+        } else {
+            DeliveryResult::Failed
+        }
+    }
+
+    /// Send full notification via WebSocket Bus
     #[instrument(skip(self, bus, notification), fields(
-        notification_id = %notification.notification_id,
+        id = %notification.id,
         user_id = %notification.user_id
     ))]
     async fn send_via_bus(&self, bus: &BusClient, notification: &Notification) -> Result<usize, String> {
         let start = Instant::now();
 
-        // Create sync_notify envelope
-        // This tells the client to fetch new notifications from the API
-        let envelope = BusEnvelope::new("notifications", "sync_notify")
+        // Create full notification envelope for direct client caching
+        let envelope = BusEnvelope::new("notifications", "notification")
             .with_payload(serde_json::json!({
-                "type": "sync_notify",
-                "count": 1
+                "id": notification.id,
+                "user_id": notification.user_id,
+                "actor_user_id": notification.actor_user_id,
+                "notification_type": notification.notification_type,
+                "target_type": notification.target_type,
+                "target_id": notification.target_id,
+                "title": notification.title,
+                "message": notification.message,
+                "payload": notification.payload,
+                "deep_link": notification.deep_link,
+                "priority": notification.priority,
+                "status": "unread",
+                "created_at": notification.created_at
             }));
 
-        trace!("sync_notify envelope created: {:?}", envelope);
-        trace!("Publishing to user {} via WebSocket Bus...", notification.user_id);
+        trace!("notification envelope created: {:?}", envelope);
+        trace!("Publishing full notification to user {} via WebSocket Bus...", notification.user_id);
 
         match bus.publish_to_user(notification.user_id, &envelope).await {
             Ok(response) => {
                 let duration = start.elapsed();
                 debug!(
-                    notification_id = %notification.notification_id,
+                    id = %notification.id,
                     user_id = %notification.user_id,
                     delivered_to = response.delivered_to,
                     duration_ms = duration.as_millis() as u64,
-                    "sync_notify published via Bus"
+                    "Full notification published via Bus"
                 );
                 Ok(response.delivered_to)
             }
@@ -326,7 +420,7 @@ impl NotificationWorker {
 
     /// Send push notification via FCM
     #[instrument(skip(self, notification), fields(
-        notification_id = %notification.notification_id,
+        id = %notification.id,
         user_id = %notification.user_id
     ))]
     async fn send_via_push(&self, notification: &Notification) -> Result<usize, String> {
@@ -435,21 +529,21 @@ impl NotificationWorker {
     }
 
     /// Mark notification as successfully delivered
-    #[instrument(skip(self), fields(notification_id = %notification_id))]
-    async fn mark_success(&self, notification_id: Uuid) {
-        trace!("Marking notification {} as success", notification_id);
+    #[instrument(skip(self), fields(id = %id))]
+    async fn mark_success(&self, id: Uuid) {
+        trace!("Marking notification {} as success", id);
         let start = Instant::now();
 
-        if let Err(e) = NotificationQueries::mark_success(&self.pool, notification_id).await {
+        if let Err(e) = NotificationQueries::mark_success(&self.pool, id).await {
             error!(
-                notification_id = %notification_id,
+                id = %id,
                 error = %e,
                 duration_ms = start.elapsed().as_millis() as u64,
                 "Failed to mark notification as success in database"
             );
         } else {
             trace!(
-                notification_id = %notification_id,
+                id = %id,
                 duration_ms = start.elapsed().as_millis() as u64,
                 "Notification marked as processed"
             );
@@ -457,17 +551,17 @@ impl NotificationWorker {
     }
 
     /// Mark notification failure with error tracking
-    #[instrument(skip(self), fields(notification_id = %notification_id, error = %error))]
-    async fn mark_failure(&self, notification_id: Uuid, error: &str) {
+    #[instrument(skip(self), fields(id = %id, error = %error))]
+    async fn mark_failure(&self, id: Uuid, error: &str) {
         trace!(
             "Recording failure for notification {}: {}",
-            notification_id, error
+            id, error
         );
         let start = Instant::now();
 
         match NotificationQueries::mark_failure(
             &self.pool,
-            notification_id,
+            id,
             error,
             self.config.max_retries,
         ).await {
@@ -475,14 +569,14 @@ impl NotificationWorker {
                 let duration = start.elapsed();
                 if stopped {
                     warn!(
-                        notification_id = %notification_id,
+                        id = %id,
                         max_retries = self.config.max_retries,
                         duration_ms = duration.as_millis() as u64,
                         "Notification permanently failed - max retries reached"
                     );
                 } else {
                     debug!(
-                        notification_id = %notification_id,
+                        id = %id,
                         error = %error,
                         duration_ms = duration.as_millis() as u64,
                         "Notification failure recorded, will retry later"
@@ -491,7 +585,7 @@ impl NotificationWorker {
             }
             Err(e) => {
                 error!(
-                    notification_id = %notification_id,
+                    id = %id,
                     error = %e,
                     duration_ms = start.elapsed().as_millis() as u64,
                     "Failed to record notification failure in database"
